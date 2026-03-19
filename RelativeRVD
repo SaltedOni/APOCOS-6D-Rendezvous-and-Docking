@@ -1,0 +1,802 @@
+"""
+docking_corridor_fsm.py
+=======================
+Extends the base docking script with:
+  Step 1 – Corridor + keep-out math helpers
+  Step 2 – Explicit input bundle (Target, Shuttle, End-Effector)
+  Step 3 – Conical corridor as an inside/outside test (cone tightens near dock)
+  Step 4 – Spherical keep-out zone around the shuttle
+  Step 5 – FSM states with guard rules
+  Step 6 – 2-D visualizer (matplotlib) for offline debugging
+
+All waypoints are resolved through _resolve(target, dx, dy) so every phase
+works in target-relative offsets — change TARGET_X/TARGET_Y (or pass a live
+pose) and the full sequence follows without any other edits.
+
+Run normally  → python docking_corridor_fsm.py
+Run visualizer → python docking_corridor_fsm.py --viz
+"""
+
+import time
+import math
+import argparse
+from math import isclose, acos, sqrt, pi
+from enum import Enum, auto
+
+# ── Hardware imports guarded so the visualizer works without the hardware SDK ──
+try:
+    from pmclib import xbot_commands as bot
+    from pmclib import system_commands as sys
+    from pmclib import pmc_types as pm
+    HARDWARE_AVAILABLE = True
+except ImportError:
+    HARDWARE_AVAILABLE = False
+    print("⚠  pmclib not found – running in SIMULATION / VIZ mode only.")
+
+
+# ==========================================================
+#  MACHINE LIMITS
+# ==========================================================
+X_MIN, X_MAX = 0.000, 0.960
+Y_MIN, Y_MAX = 4.330, 4.780
+
+TARGET_X = 0.830
+TARGET_Y = 4.680
+
+Z_MIN_SAFE = 0.001
+Z_MAX_SAFE = 0.004
+Z_SPEED    = 0.002
+R_SPEED    = 0.1
+TILT_LIMIT = 0.01
+
+
+# ==========================================================
+#  RVD PARAMETERS
+#  ── Real-space analogy ──────────────────────────────────
+#  Table  470 mm  →  Space  10 km   (FAR rendezvous)
+#  Table   47 mm  →  Space   1 km   (MID approach, half speed)
+#  Table    8 mm  →  Space  200 m   (keep-out zone)
+# ==========================================================
+FAR_OFFSET_X       = -0.470   # 470 mm behind dock along X  (≈ 10 km in real space)
+FAR_OFFSET_Y       =  0.000
+
+MID_OFFSET_X       = -0.047   #  47 mm behind dock          (≈  1 km in real space)
+MID_OFFSET_Y       =  0.000
+
+HOLD_OFFSET_X      = -0.003   #   3 mm – fine alignment gate before contact
+HOLD_OFFSET_Y      =  0.000
+
+HOLD_LATERAL_TOL   = 0.0015
+
+DWELL_FAR          = 2.0    # pause at FAR waypoint  (s)
+DWELL_MID          = 2.0    # pause at MID waypoint  (s)
+DWELL_HOLD         = 2.0    # pause at HOLD point    (s)
+
+# ── XY approach speeds (m/s) ─────────────────────────────
+XY_SPEED_FULL      = 1.0    # full speed  – FAR approach
+XY_SPEED_MID       = 0.5    # half speed  – MID approach
+XY_SPEED_HOLD      = 0.25   # quarter speed – fine alignment gate
+
+
+# ==========================================================
+#  CORRIDOR + KEEP-OUT PARAMETERS
+# ==========================================================
+APPROACH_AXIS_2D     = (-1.0, 0.0)
+CONE_HALF_ANGLE_FAR  = math.radians(10.0)
+CONE_HALF_ANGLE_NEAR = math.radians( 3.0)
+CONE_TIGHTEN_START_D = 0.020
+CONE_FULL_TIGHT_D    = 0.005
+KEEPOUT_RADIUS       = 0.008
+
+
+# ==========================================================
+#  STEP 2 – INPUT BUNDLE
+# ==========================================================
+class Pose2D:
+    """Minimal 2-D pose used for corridor/keep-out math."""
+    def __init__(self, x: float, y: float):
+        self.x = x
+        self.y = y
+
+    def __repr__(self):
+        return f"Pose2D(x={self.x:.5f}, y={self.y:.5f})"
+
+
+# ==========================================================
+#  STEP 3 – CONICAL CORRIDOR  (inside / outside test)
+# ==========================================================
+class CorridorChecker:
+    def __init__(
+        self,
+        axis=APPROACH_AXIS_2D,
+        theta_far=CONE_HALF_ANGLE_FAR,
+        theta_near=CONE_HALF_ANGLE_NEAR,
+        d_start=CONE_TIGHTEN_START_D,
+        d_near=CONE_FULL_TIGHT_D,
+    ):
+        mag = sqrt(axis[0]**2 + axis[1]**2)
+        self.axis       = (axis[0]/mag, axis[1]/mag)
+        self.theta_far  = theta_far
+        self.theta_near = theta_near
+        self.d_start    = d_start
+        self.d_near     = d_near
+
+    def compute(self, target: Pose2D, ee: Pose2D):
+        """Returns (distance, theta_rad, theta_max_rad, inside_corridor)."""
+        rx = ee.x - target.x
+        ry = ee.y - target.y
+        d  = sqrt(rx**2 + ry**2)
+        if d < 1e-9:
+            return 0.0, 0.0, self.theta_far, True
+        r_hat_x = rx / d
+        r_hat_y = ry / d
+        dot = max(-1.0, min(1.0, r_hat_x * self.axis[0] + r_hat_y * self.axis[1]))
+        theta     = acos(dot)
+        theta_max = self._theta_max(d)
+        return d, theta, theta_max, (theta <= theta_max)
+
+    def _theta_max(self, d: float) -> float:
+        if d >= self.d_start:
+            return self.theta_far
+        if d <= self.d_near:
+            return self.theta_near
+        t = (d - self.d_near) / (self.d_start - self.d_near)
+        return self.theta_near + (self.theta_far - self.theta_near) * t
+
+
+# ==========================================================
+#  STEP 4 – KEEP-OUT ZONE  (sphere / circle)
+# ==========================================================
+class KeepOutChecker:
+    def __init__(self, radius: float = KEEPOUT_RADIUS):
+        self.radius = radius
+
+    def distance(self, shuttle: Pose2D, ee: Pose2D) -> float:
+        return sqrt((ee.x - shuttle.x)**2 + (ee.y - shuttle.y)**2)
+
+    def inside_zone(self, shuttle: Pose2D, ee: Pose2D) -> bool:
+        return self.distance(shuttle, ee) < self.radius
+
+    def violated(self, shuttle: Pose2D, ee: Pose2D, in_corridor: bool) -> bool:
+        return self.inside_zone(shuttle, ee) and (not in_corridor)
+
+
+# ==========================================================
+#  STEP 5 – FSM WITH GUARD RULES
+# ==========================================================
+class DockState(Enum):
+    STARTUP      = auto()
+    FAR_APPROACH = auto()
+    MID_APPROACH = auto()
+    MID_HOLD     = auto()
+    CONTACT      = auto()
+    SUCCESS      = auto()
+    ABORT        = auto()
+
+
+class DockingFSM:
+    CORRIDOR_WARN_LIMIT = 3
+    KEEPOUT_ABORT_LIMIT = 1
+
+    def __init__(self):
+        self.state                = DockState.STARTUP
+        self.corridor             = CorridorChecker()
+        self.keepout              = KeepOutChecker()
+        self._corridor_violations = 0
+        self._trajectory          = []
+
+    def check_guards(self, target: Pose2D, ee: Pose2D) -> bool:
+        self._trajectory.append((ee.x, ee.y, self.state.name))
+        d, theta, theta_max, in_corridor = self.corridor.compute(target, ee)
+        ko_violated = self.keepout.violated(target, ee, in_corridor)
+
+        if ko_violated:
+            print(
+                f"🚨 KEEP-OUT VIOLATION at {ee}  |  d={d*1e3:.2f} mm  "
+                f"(limit {self.keepout.radius*1e3:.1f} mm)  "
+                f"state={self.state.name}"
+            )
+            self._corridor_violations = 0
+            self._transition(DockState.ABORT)
+            return False
+
+        if not in_corridor:
+            self._corridor_violations += 1
+            print(
+                f"⚠  Corridor violation #{self._corridor_violations}  "
+                f"θ={math.degrees(theta):.1f}°  θ_max={math.degrees(theta_max):.1f}°  "
+                f"d={d*1e3:.2f} mm  state={self.state.name}"
+            )
+            if (self.state in (DockState.MID_HOLD, DockState.CONTACT) or
+                    self._corridor_violations >= self.CORRIDOR_WARN_LIMIT):
+                self._transition(DockState.ABORT)
+                return False
+        else:
+            if self._corridor_violations:
+                print(f"✔  Back inside corridor (d={d*1e3:.2f} mm, "
+                      f"θ={math.degrees(theta):.1f}°)")
+            self._corridor_violations = 0
+
+        return True
+
+    def _transition(self, new_state: DockState):
+        print(f"FSM: {self.state.name} → {new_state.name}")
+        self.state = new_state
+
+    def advance(self, new_state: DockState):
+        self._transition(new_state)
+
+    @property
+    def trajectory(self):
+        return list(self._trajectory)
+
+
+# ==========================================================
+#  STEP 6 – 2-D VISUALIZER
+# ==========================================================
+def visualize_2d(
+    target: Pose2D,
+    trajectory,
+    corridor: CorridorChecker,
+    keepout: KeepOutChecker,
+    title: str = "Docking Corridor & Keep-Out Debug View",
+):
+    try:
+        import matplotlib
+        matplotlib.use("TkAgg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle, Wedge
+    except ImportError:
+        print("⚠  matplotlib not installed – skipping visualizer.")
+        return
+
+    fig, ax = plt.subplots(figsize=(16, 7))
+    ax.set_facecolor("#0d1117")
+    fig.patch.set_facecolor("#0d1117")
+    for spine in ax.spines.values():
+        spine.set_color("#30363d")
+    ax.tick_params(colors="#8b949e", labelsize=8)
+    ax.xaxis.label.set_color("#8b949e")
+    ax.yaxis.label.set_color("#8b949e")
+
+    axis_angle_deg = math.degrees(math.atan2(corridor.axis[1], corridor.axis[0]))
+
+    for (radius, half_angle, colour, label_text) in [
+        (CONE_TIGHTEN_START_D * 3,  corridor.theta_far,  "#1f6feb",
+         f"Far corridor ±{math.degrees(corridor.theta_far):.0f}°"),
+        (CONE_FULL_TIGHT_D   * 2.5, corridor.theta_near, "#388bfd",
+         f"Near corridor ±{math.degrees(corridor.theta_near):.0f}°"),
+    ]:
+        half_deg = math.degrees(half_angle)
+        wedge = Wedge(
+            center=(target.x, target.y), r=radius,
+            theta1=axis_angle_deg - half_deg,
+            theta2=axis_angle_deg + half_deg,
+            color=colour, alpha=0.18, label=label_text, zorder=2,
+        )
+        for sign in (+1, -1):
+            angle = math.radians(axis_angle_deg + sign * half_deg)
+            ax.plot(
+                [target.x, target.x + math.cos(angle) * radius],
+                [target.y, target.y + math.sin(angle) * radius],
+                color=colour, lw=0.8, alpha=0.6, zorder=3,
+            )
+        ax.add_patch(wedge)
+
+    for (radius, colour, style, label_text, ann_text) in [
+        (abs(FAR_OFFSET_X), "#3fb950", "--",
+         f"Far rendezvous r={abs(FAR_OFFSET_X)*1e3:.0f} mm",
+         f"FAR RVD\n{abs(FAR_OFFSET_X)*1e3:.0f} mm"),
+        (abs(MID_OFFSET_X), "#e3b341", "--",
+         f"Mid approach r={abs(MID_OFFSET_X)*1e3:.0f} mm",
+         f"MID APP\n{abs(MID_OFFSET_X)*1e3:.0f} mm  (½ speed)"),
+    ]:
+        c = Circle(
+            (target.x, target.y), radius=radius,
+            fill=True, facecolor=colour, alpha=0.07,
+            edgecolor=colour, linewidth=1.5, linestyle=style,
+            label=label_text, zorder=3,
+        )
+        ax.add_patch(c)
+        ax.annotate(
+            ann_text, (target.x - radius, target.y),
+            textcoords="offset points", xytext=(-28, 6),
+            color=colour, fontsize=6.5, zorder=11,
+            arrowprops=dict(arrowstyle="-", color=colour, lw=0.6),
+        )
+
+    ax.add_patch(Circle(
+        (target.x, target.y), radius=keepout.radius,
+        fill=True, facecolor="#f85149", alpha=0.20,
+        edgecolor="#f85149", linewidth=1.5,
+        label=f"Keep-out r={keepout.radius*1e3:.0f} mm", zorder=4,
+    ))
+
+    ax.plot(target.x, target.y, marker="X", ms=12,
+            color="#f0883e", zorder=10, label="Dock target")
+    ax.annotate("TARGET", (target.x, target.y),
+                textcoords="offset points", xytext=(6, 6),
+                color="#f0883e", fontsize=7, zorder=11)
+
+    state_colours = {
+        "STARTUP":      "#8b949e",
+        "FAR_APPROACH": "#3fb950",
+        "MID_APPROACH": "#58a6ff",
+        "MID_HOLD":     "#d2a8ff",
+        "CONTACT":      "#ffa657",
+        "SUCCESS":      "#56d364",
+        "ABORT":        "#f85149",
+    }
+
+    if trajectory:
+        xs = [p[0] for p in trajectory]
+        ys = [p[1] for p in trajectory]
+        ax.plot(xs, ys, color="#484f58", lw=0.8, zorder=5)
+        for i, (x, y, sname) in enumerate(trajectory):
+            col = state_colours.get(sname, "#8b949e")
+            ax.scatter(x, y, s=40, color=col, zorder=6, linewidths=0)
+            ax.annotate(
+                f"#{i}\n{sname}",
+                (x, y),
+                textcoords="offset points",
+                xytext=(6, 6),
+                color=col,
+                fontsize=5.5,
+                fontweight="bold",
+                zorder=12,
+                bbox=dict(
+                    boxstyle="round,pad=0.2",
+                    facecolor="#0d1117",
+                    edgecolor=col,
+                    alpha=0.75,
+                    linewidth=0.6,
+                ),
+            )
+        ax.plot(xs[0], ys[0], "o", ms=9, color="#3fb950", zorder=9, label="Start")
+        ax.plot(xs[-1], ys[-1], "s", ms=9, color="#ffa657", zorder=9, label="End")
+        for sname, col in state_colours.items():
+            if sname in {p[2] for p in trajectory}:
+                ax.scatter([], [], s=40, color=col, label=f"State: {sname}", zorder=0)
+
+    margin_x = abs(FAR_OFFSET_X) + 0.020
+    margin_y = abs(FAR_OFFSET_X) * 0.25
+    nx, ny = 300, 120
+    gx = [target.x - margin_x + (2*margin_x/nx)*i for i in range(nx)]
+    gy = [target.y - margin_y + (2*margin_y/ny)*j for j in range(ny)]
+    in_mask = [[1.0 if corridor.compute(target, Pose2D(cx, cy))[3] else 0.0
+                for cx in gx] for cy in gy]
+    ax.contourf(gx, gy, in_mask, levels=[0.5, 1.5],
+                colors=["#1f6feb"], alpha=0.07, zorder=1)
+
+    ax.set_title(title, color="#e6edf3", fontsize=11, pad=10)
+    ax.set_xlabel("X (m)", fontsize=9)
+    ax.set_ylabel("Y (m)", fontsize=9)
+    ax.set_xlim(target.x - margin_x, target.x + 0.030)
+    ax.set_ylim(target.y - margin_y, target.y + margin_y)
+    ax.set_aspect("equal")
+    ax.legend(fontsize=7, loc="upper left",
+              facecolor="#161b22", edgecolor="#30363d", labelcolor="#c9d1d9")
+    ax.axhline(target.y, color="#21262d", lw=0.5, zorder=0)
+    ax.axvline(target.x, color="#21262d", lw=0.5, zorder=0)
+
+    plt.tight_layout()
+    plt.savefig("docking_debug_view.png", dpi=180, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print("📊 Debug plot saved to docking_debug_view.png")
+    plt.show()
+
+
+# ==========================================================
+#  UTILITY HELPERS
+# ==========================================================
+def clip(value, vmin, vmax):
+    return max(vmin, min(value, vmax))
+
+def near(a, b, tol=1e-6):
+    return isclose(a, b, abs_tol=tol)
+
+
+# ==========================================================
+#  SYSTEM STARTUP
+# ==========================================================
+class StartingUp:
+    @staticmethod
+    def run_start_up_routine(expected_xbot_count=1) -> bool:
+        if not HARDWARE_AVAILABLE:
+            print("SIMULATION: skipping hardware startup.")
+            return True
+
+        print("Connecting to Planar Motor Controller…")
+        if not sys.auto_search_and_connect_to_pmc():
+            print("❌ Could not connect.")
+            return False
+
+        print("Gaining mastership…")
+        sys.gain_mastership()
+
+        while True:
+            st = sys.get_pmc_status()
+            if st in (pm.PMCSTATUS.PMC_FULLCTRL, pm.PMCSTATUS.PMC_INTELLIGENTCTRL):
+                break
+            if st in (pm.PMCSTATUS.PMC_ERROR, pm.PMCSTATUS.PMC_INACTIVE):
+                bot.activate_xbots()
+            time.sleep(0.5)
+
+        ids = bot.get_xbot_ids()
+        if ids.PmcRtn != pm.PMCRTN.ALLOK or ids.xbot_count != expected_xbot_count:
+            print("❌ Incorrect mover count.")
+            return False
+
+        bot.stop_motion(0)
+
+        print("Levitation check…")
+        while True:
+            all_up = True
+            ids = bot.get_xbot_ids()
+            for x in ids.xbot_ids_array:
+                st = bot.get_xbot_status(x).xbot_state
+                if st in (pm.XBOTSTATE.XBOT_LANDED,
+                          pm.XBOTSTATE.XBOT_STOPPING,
+                          pm.XBOTSTATE.XBOT_DISCOVERING,
+                          pm.XBOTSTATE.XBOT_MOTION):
+                    all_up = False
+            if all_up:
+                break
+            bot.levitation_command(0, pm.LEVITATEOPTIONS.LEVITATE)
+            time.sleep(0.2)
+
+        print("✅ Startup complete.")
+        return True
+
+
+# ==========================================================
+#  LIFTOFF + RVD  (FSM-guarded)
+# ==========================================================
+class LiftOffWithTiltRecovery:
+
+    # ─────────────────────────────────────────────────────
+    #  CORE HELPER: resolve target-relative offset → clipped
+    #  absolute table position.
+    #
+    #  Every phase calls this instead of writing
+    #  "clip(TARGET_X + OFFSET, X_MIN, X_MAX)" inline.
+    #  To track a moving dock, simply pass a fresh Pose2D
+    #  each tick — nothing else needs to change.
+    # ─────────────────────────────────────────────────────
+    @staticmethod
+    def _resolve(target: Pose2D, dx: float, dy: float) -> tuple:
+        """Convert a target-relative (dx, dy) offset to a clipped
+        absolute table position.  Returns (abs_x, abs_y)."""
+        return (
+            clip(target.x + dx, X_MIN, X_MAX),
+            clip(target.y + dy, Y_MIN, Y_MAX),
+        )
+
+    @staticmethod
+    def get_mover_id():
+        return bot.get_xbot_ids().xbot_ids_array[0]
+
+    @staticmethod
+    def wait_idle(xbot_id):
+        while bot.get_xbot_status(xbot_id).xbot_state != pm.XBOTSTATE.XBOT_IDLE:
+            time.sleep(0.05)
+
+    @staticmethod
+    def get_xy(xbot_id):
+        st = bot.get_xbot_status(xbot_id).feedback_position_si
+        return float(st[0]), float(st[1])
+
+    @staticmethod
+    def move_to_xy(xbot_id, x, y, label=100, speed=None):
+        if speed is None:
+            speed = XY_SPEED_FULL
+        x_cmd = clip(x, X_MIN, X_MAX)
+        y_cmd = clip(y, Y_MIN, Y_MAX)
+        print(f"Moving to ({x_cmd:.3f}, {y_cmd:.3f})  speed={speed:.2f} m/s…")
+        bot.linear_motion_si(
+            label, xbot_id,
+            pm.POSITIONMODE.ABSOLUTE,
+            pm.LINEARPATHTYPE.DIRECT,
+            x_cmd, y_cmd,
+            0.0, speed, 10.0, 0.0
+        )
+        LiftOffWithTiltRecovery.wait_idle(xbot_id)
+
+    @staticmethod
+    def _safe_short_axes_move(xbot_id, target_z,
+                              rx=0.0, ry=0.0, rz=0.0, label=200):
+        clamped = clip(target_z, Z_MIN_SAFE, Z_MAX_SAFE)
+        try:
+            bot.short_axes_motion_si(
+                label, xbot_id, pm.POSITIONMODE.ABSOLUTE,
+                clamped, rx, ry, rz,
+                Z_SPEED, R_SPEED, R_SPEED, R_SPEED
+            )
+            LiftOffWithTiltRecovery.wait_idle(xbot_id)
+            return True
+        except Exception:
+            try:
+                bot.short_axes_motion_si(
+                    label+1, xbot_id, pm.POSITIONMODE.ABSOLUTE,
+                    Z_MAX_SAFE, 0, 0, 0,
+                    Z_SPEED, R_SPEED, R_SPEED, R_SPEED
+                )
+                LiftOffWithTiltRecovery.wait_idle(xbot_id)
+                return True
+            except Exception as e2:
+                print(f"❌ Z move failed: {e2}")
+                return False
+
+    @staticmethod
+    def attempt_liftoff(xbot_id, requested_lift=0.004):
+        st = bot.get_xbot_status(xbot_id)
+        z0 = float(st.feedback_position_si[2])
+        target = clip(z0 + requested_lift, Z_MIN_SAFE, Z_MAX_SAFE)
+        print(f"Lifting Z: {z0:.4f} → {target:.4f}")
+        ok = LiftOffWithTiltRecovery._safe_short_axes_move(xbot_id, target, 0, 0, 0)
+        if not ok:
+            return False
+        st2 = bot.get_xbot_status(xbot_id)
+        z1 = float(st2.feedback_position_si[2])
+        if z1 < target - 0.0003:
+            print(f"❌ COLLISION: moved {z1-z0:.4f} instead of {target-z0:.4f}")
+            return False
+        rx = float(st2.feedback_position_si[3])
+        ry = float(st2.feedback_position_si[4])
+        if abs(rx) > TILT_LIMIT or abs(ry) > TILT_LIMIT:
+            print(f"❌ Tilt too high (rx={rx:.4f}, ry={ry:.4f})")
+            return False
+        print("✔ Liftoff successful.")
+        return True
+
+    @staticmethod
+    def recover(xbot_id):
+        print("Recovering: lowering to Z_MIN_SAFE…")
+        LiftOffWithTiltRecovery._safe_short_axes_move(xbot_id, Z_MIN_SAFE, 0, 0, 0, label=300)
+        time.sleep(0.15)
+        LiftOffWithTiltRecovery._safe_short_axes_move(xbot_id, Z_MIN_SAFE, 0, 0, 0, label=301)
+        print("Recovery complete.")
+
+    # ─────────────────────────────────────────────────────
+    #  PHASE 1: FAR APPROACH
+    #
+    #  All positions derived from target via _resolve so
+    #  moving the dock requires zero changes here.
+    # ─────────────────────────────────────────────────────
+    @staticmethod
+    def _phase_far_approach(xbot_id, fsm: DockingFSM, target: Pose2D):
+        print("\n=== PHASE 1: FAR APPROACH ===")
+        resolve = LiftOffWithTiltRecovery._resolve
+        cur_x, cur_y = LiftOffWithTiltRecovery.get_xy(xbot_id)
+
+        # Lateral alignment: snap Y to target, keep current X absolute.
+        # We do NOT use _resolve here because the X coordinate is the
+        # mover's current position, not a target-relative offset.
+        if not near(cur_y, target.y, HOLD_LATERAL_TOL / 2):
+            ee = Pose2D(cur_x, target.y)
+            if not fsm.check_guards(target, ee):
+                return None, None
+            print(f"Aligning lateral axis (Y → {target.y:.3f})")
+            LiftOffWithTiltRecovery.move_to_xy(xbot_id, cur_x, target.y)
+
+        # FAR waypoint — purely relative to the dock
+        far_x, far_y = resolve(target, FAR_OFFSET_X, FAR_OFFSET_Y)
+        ee = Pose2D(far_x, far_y)
+        if not fsm.check_guards(target, ee):
+            return None, None
+
+        print(f"Proceeding to FAR waypoint ({far_x:.3f}, {far_y:.3f})")
+        LiftOffWithTiltRecovery.move_to_xy(xbot_id, far_x, far_y, speed=XY_SPEED_FULL)
+        time.sleep(DWELL_FAR)
+        return far_x, far_y
+
+    # ─────────────────────────────────────────────────────
+    #  PHASE 2: MID APPROACH  (half speed)
+    # ─────────────────────────────────────────────────────
+    @staticmethod
+    def _phase_mid_approach(xbot_id, fsm: DockingFSM, target: Pose2D):
+        print("\n=== PHASE 2: MID APPROACH  (speed → 50%) ===")
+        resolve = LiftOffWithTiltRecovery._resolve
+
+        mid_x, mid_y = resolve(target, MID_OFFSET_X, MID_OFFSET_Y)
+        ee = Pose2D(mid_x, mid_y)
+        if not fsm.check_guards(target, ee):
+            return None, None
+
+        print(f"Advancing to MID waypoint ({mid_x:.3f}, {mid_y:.3f})  [half speed]")
+        LiftOffWithTiltRecovery.move_to_xy(xbot_id, mid_x, mid_y, speed=XY_SPEED_MID)
+        time.sleep(DWELL_MID)
+        return mid_x, mid_y
+
+    # ─────────────────────────────────────────────────────
+    #  PHASE 3: HOLD POINT  (quarter speed)
+    # ─────────────────────────────────────────────────────
+    @staticmethod
+    def _phase_hold(xbot_id, fsm: DockingFSM, target: Pose2D):
+        print("\n=== PHASE 3: HOLD POINT  (speed → 25%) ===")
+        resolve = LiftOffWithTiltRecovery._resolve
+
+        hold_x, hold_y = resolve(target, HOLD_OFFSET_X, HOLD_OFFSET_Y)
+        ee = Pose2D(hold_x, hold_y)
+        if not fsm.check_guards(target, ee):
+            return None, None
+
+        print(f"Advancing to HOLD ({hold_x:.3f}, {hold_y:.3f})  [quarter speed]")
+        LiftOffWithTiltRecovery.move_to_xy(xbot_id, hold_x, hold_y, speed=XY_SPEED_HOLD)
+
+        # Fine lateral correction after reaching HOLD
+        cur_x, cur_y = LiftOffWithTiltRecovery.get_xy(xbot_id)
+        if abs(cur_y - hold_y) > HOLD_LATERAL_TOL:
+            print(f"Correcting lateral offset (ΔY={cur_y - hold_y:+.4f})")
+            ee2 = Pose2D(cur_x, hold_y)
+            if not fsm.check_guards(target, ee2):
+                return None, None
+            LiftOffWithTiltRecovery.move_to_xy(xbot_id, cur_x, hold_y, speed=XY_SPEED_HOLD)
+
+        time.sleep(DWELL_HOLD)
+        return hold_x, hold_y
+
+    # ─────────────────────────────────────────────────────
+    #  MAIN ROUTINE
+    # ─────────────────────────────────────────────────────
+    @staticmethod
+    def run_liftoff_routine():
+        print("=== FSM DOCKING: FAR → MID → HOLD → CONTACT/CAPTURE ===\n")
+
+        if not StartingUp.run_start_up_routine(1):
+            return
+
+        xbot_id = LiftOffWithTiltRecovery.get_mover_id()
+        fsm = DockingFSM()
+
+        # Single source of truth for the dock position.
+        # Replace with a live sensor read here if tracking a moving target.
+        target_pose = Pose2D(TARGET_X, TARGET_Y)
+
+        # Timer covers the full sequence from first move to capture
+        docking_start = time.time()
+        print("⏱ Docking timer started.")
+
+        # ── PHASE 1: FAR APPROACH (full speed) ───────────
+        fsm.advance(DockState.FAR_APPROACH)
+        far_x, far_y = LiftOffWithTiltRecovery._phase_far_approach(
+            xbot_id, fsm, target_pose
+        )
+        if far_x is None:
+            print("❌ FAR APPROACH aborted by guard.")
+            return
+
+        # ── PHASE 2: MID APPROACH (half speed) ───────────
+        fsm.advance(DockState.MID_APPROACH)
+        mid_x, mid_y = LiftOffWithTiltRecovery._phase_mid_approach(
+            xbot_id, fsm, target_pose
+        )
+        if mid_x is None:
+            print("❌ MID APPROACH aborted by guard.")
+            return
+
+        # ── PHASE 3: HOLD POINT (quarter speed) ──────────
+        fsm.advance(DockState.MID_HOLD)
+        base_x, base_y = LiftOffWithTiltRecovery._phase_hold(
+            xbot_id, fsm, target_pose
+        )
+        if base_x is None:
+            print("❌ HOLD aborted by guard.")
+            return
+
+        # ── PHASE 4: CONTACT & CAPTURE ───────────────────
+        # Contact point is dead center on the dock.
+        # No XY correction is applied after a failed attempt — any lateral
+        # nudge at sub-millimetre distances exceeds the tight corridor
+        # (±3°) and triggers a keep-out violation.
+        # The loop simply recovers Z and retries in place.
+        fsm.advance(DockState.CONTACT)
+        print("\n=== PHASE 4: CONTACT & CAPTURE ===")
+        attempt = 1
+
+        while True:
+            print(f"\n--- Attempt #{attempt} @ ({base_x:.4f}, {base_y:.4f}) ---")
+
+            ee_now = Pose2D(base_x, base_y)
+            if not fsm.check_guards(target_pose, ee_now):
+                print("❌ Guard triggered during CONTACT phase. Aborting.")
+                break
+
+            if LiftOffWithTiltRecovery.attempt_liftoff(xbot_id):
+                docking_time = time.time() - docking_start
+                fsm.advance(DockState.SUCCESS)
+                print(f"\n🏆 SUCCESS  |  total time={docking_time:.2f}s  |  attempts={attempt}")
+
+                while True:
+                    user_input = input("Was the docking actually successful? (y/n): ").strip().lower()
+                    if user_input in ("y", "n"):
+                        if user_input == "y":
+                            for fname, value in [
+                                ("docking times 35 pos 1",    f"{docking_time:.2f}\n"),
+                                ("docking attempts 35 pos 1", f"{attempt}\n"),
+                            ]:
+                                try:
+                                    with open(fname, "a", encoding="utf-8") as f:
+                                        f.write(value)
+                                except Exception as e:
+                                    print(f"⚠ Write error: {e}")
+                        break
+                    print("Please enter 'y' or 'n'.")
+                return
+
+            # Recover Z only – XY position stays fixed at dead center.
+            print("❗ Collision or tilt → Recovering Z and retrying in place…")
+            LiftOffWithTiltRecovery.recover(xbot_id)
+            attempt += 1
+
+
+# ==========================================================
+#  SIMULATION / VIZ-ONLY PATH
+# ==========================================================
+def run_simulation_and_viz():
+    print("\n══════════════════════════════════════════")
+    print("  SIMULATION MODE – corridor & keep-out test")
+    print("══════════════════════════════════════════\n")
+
+    target   = Pose2D(TARGET_X, TARGET_Y)
+    corridor = CorridorChecker()
+    keepout  = KeepOutChecker()
+    fsm      = DockingFSM()
+
+    # Shorthand so waypoint tuples stay readable.
+    # Every position is expressed as (dx, dy) relative to target — the
+    # same mental model used by all the phase methods above.
+    R = LiftOffWithTiltRecovery._resolve
+
+    # Waypoints no longer include the off-axis tilt correction step —
+    # the contact loop retries in place, so waypoint 5 goes straight to SUCCESS.
+    waypoints = [
+        (*R(target, -0.500,  0.010), DockState.FAR_APPROACH),   # slight lateral error
+        (*R(target, -0.500,  0.000), DockState.FAR_APPROACH),   # lateral corrected
+        (*R(target, FAR_OFFSET_X,  FAR_OFFSET_Y),  DockState.FAR_APPROACH),
+        (*R(target, MID_OFFSET_X,  MID_OFFSET_Y),  DockState.MID_APPROACH),
+        (*R(target, HOLD_OFFSET_X, HOLD_OFFSET_Y), DockState.MID_HOLD),
+        (*R(target, -0.001,  0.000), DockState.CONTACT),
+        (*R(target,  0.000,  0.000), DockState.SUCCESS),
+    ]
+
+    WAYPOINT_DWELL = 1.5
+
+    for i, (wx, wy, ws) in enumerate(waypoints):
+        fsm.state = ws
+        ee = Pose2D(wx, wy)
+        d, theta, theta_max, in_corr = corridor.compute(target, ee)
+        ko = keepout.violated(target, ee, in_corr)
+        ok = fsm.check_guards(target, ee)
+
+        print(f"\n{'─'*60}")
+        print(f"  Waypoint {i}  |  State: {ws.name}")
+        print(f"  Position  : x={wx:.5f}  y={wy:.5f}")
+        print(f"  Distance  : {d*1e3:.2f} mm")
+        print(f"  Angle     : θ={math.degrees(theta):.1f}°  (limit {math.degrees(theta_max):.1f}°)")
+        print(f"  Corridor  : {'✔ INSIDE' if in_corr else '✘ OUTSIDE'}")
+        print(f"  Keep-out  : {'🚨 VIOLATED' if ko else '✔ OK'}")
+        print(f"  Guard     : {'✔ PASS' if ok else '✘ ABORT'}")
+        print(f"{'─'*60}")
+
+        time.sleep(WAYPOINT_DWELL)
+
+    print("\nGenerating 2-D debug plot…")
+    visualize_2d(target, fsm.trajectory, corridor, keepout)
+
+
+# ==========================================================
+#  ENTRY POINT
+# ==========================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--viz", action="store_true",
+        help="Run offline simulation + 2-D visualizer (no hardware needed)"
+    )
+    args = parser.parse_args()
+
+    if args.viz or not HARDWARE_AVAILABLE:
+        run_simulation_and_viz()
+    else:
+        LiftOffWithTiltRecovery.run_liftoff_routine()
