@@ -9,6 +9,16 @@ Extends the base docking script with:
   Step 5 – FSM states with guard rules
   Step 6 – 2-D visualizer (matplotlib) for offline debugging
 
+CORRIDOR_ENTRY state (added):
+  Fires once the mover has completed lateral alignment and is positioned
+  at the corridor entry point (FAR waypoint, on the approach axis).
+  This is the explicit "commit to straight-in run" gate.  The corridor
+  axis geometrically passes through the keep-out zone — CORRIDOR_ENTRY
+  acknowledges that intentionally; KeepOutChecker.violated() already
+  permits keep-out penetration when in_corridor=True, so no safety logic
+  changes are needed — the new state simply makes the gate visible in the
+  FSM sequence and trajectory log.
+
 All waypoints are resolved through _resolve(target, dx, dy) so every phase
 works in target-relative offsets — change TARGET_X/TARGET_Y (or pass a live
 pose) and the full sequence follows without any other edits.
@@ -73,9 +83,10 @@ DWELL_MID          = 2.0    # pause at MID waypoint  (s)
 DWELL_HOLD         = 2.0    # pause at HOLD point    (s)
 
 # ── XY approach speeds (m/s) ─────────────────────────────
-XY_SPEED_FULL      = 1.0    # full speed  – FAR approach
-XY_SPEED_MID       = 0.5    # half speed  – MID approach
-XY_SPEED_HOLD      = 0.25   # quarter speed – fine alignment gate
+XY_SPEED_FULL      = 1.0    # full speed        – FAR approach
+XY_SPEED_MID       = 0.5    # half speed        – MID approach
+XY_SPEED_CORRIDOR  = 0.25   # quarter speed     – corridor entry (keep-out boundary)
+XY_SPEED_HOLD      = 0.125  # eighth speed      – fine alignment gate
 
 
 # ==========================================================
@@ -87,6 +98,12 @@ CONE_HALF_ANGLE_NEAR = math.radians( 3.0)
 CONE_TIGHTEN_START_D = 0.020
 CONE_FULL_TIGHT_D    = 0.005
 KEEPOUT_RADIUS       = 0.008
+
+# CORRIDOR_ENTRY gate: the point on the approach axis where it pierces the
+# keep-out sphere.  From here inward, keep-out penetration is intentional
+# (the corridor axis runs straight through the zone to the dock face).
+CORRIDOR_ENTRY_OFFSET_X = -KEEPOUT_RADIUS   # –8 mm along approach axis
+CORRIDOR_ENTRY_OFFSET_Y =  0.000
 
 
 # ==========================================================
@@ -158,6 +175,9 @@ class KeepOutChecker:
         return self.distance(shuttle, ee) < self.radius
 
     def violated(self, shuttle: Pose2D, ee: Pose2D, in_corridor: bool) -> bool:
+        # Penetrating the keep-out zone along the approach corridor axis is
+        # intentional (the corridor cuts through the zone at docking).
+        # Only flag a violation when we are inside the zone AND off-axis.
         return self.inside_zone(shuttle, ee) and (not in_corridor)
 
 
@@ -165,13 +185,14 @@ class KeepOutChecker:
 #  STEP 5 – FSM WITH GUARD RULES
 # ==========================================================
 class DockState(Enum):
-    STARTUP      = auto()
-    FAR_APPROACH = auto()
-    MID_APPROACH = auto()
-    MID_HOLD     = auto()
-    CONTACT      = auto()
-    SUCCESS      = auto()
-    ABORT        = auto()
+    STARTUP         = auto()
+    FAR_APPROACH    = auto()
+    CORRIDOR_ENTRY  = auto()   # gate: vehicle aligned & committed to straight-in run
+    MID_APPROACH    = auto()
+    MID_HOLD        = auto()
+    CONTACT         = auto()
+    SUCCESS         = auto()
+    ABORT           = auto()
 
 
 class DockingFSM:
@@ -319,13 +340,14 @@ def visualize_2d(
                 color="#f0883e", fontsize=7, zorder=11)
 
     state_colours = {
-        "STARTUP":      "#8b949e",
-        "FAR_APPROACH": "#3fb950",
-        "MID_APPROACH": "#58a6ff",
-        "MID_HOLD":     "#d2a8ff",
-        "CONTACT":      "#ffa657",
-        "SUCCESS":      "#56d364",
-        "ABORT":        "#f85149",
+        "STARTUP":         "#8b949e",
+        "FAR_APPROACH":    "#3fb950",
+        "CORRIDOR_ENTRY":  "#00e5cc",   # teal – corridor commit gate
+        "MID_APPROACH":    "#58a6ff",
+        "MID_HOLD":        "#d2a8ff",
+        "CONTACT":         "#ffa657",
+        "SUCCESS":         "#56d364",
+        "ABORT":           "#f85149",
     }
 
     if trajectory:
@@ -457,11 +479,6 @@ class LiftOffWithTiltRecovery:
     # ─────────────────────────────────────────────────────
     #  CORE HELPER: resolve target-relative offset → clipped
     #  absolute table position.
-    #
-    #  Every phase calls this instead of writing
-    #  "clip(TARGET_X + OFFSET, X_MIN, X_MAX)" inline.
-    #  To track a moving dock, simply pass a fresh Pose2D
-    #  each tick — nothing else needs to change.
     # ─────────────────────────────────────────────────────
     @staticmethod
     def _resolve(target: Pose2D, dx: float, dy: float) -> tuple:
@@ -559,9 +576,6 @@ class LiftOffWithTiltRecovery:
 
     # ─────────────────────────────────────────────────────
     #  PHASE 1: FAR APPROACH
-    #
-    #  All positions derived from target via _resolve so
-    #  moving the dock requires zero changes here.
     # ─────────────────────────────────────────────────────
     @staticmethod
     def _phase_far_approach(xbot_id, fsm: DockingFSM, target: Pose2D):
@@ -570,8 +584,6 @@ class LiftOffWithTiltRecovery:
         cur_x, cur_y = LiftOffWithTiltRecovery.get_xy(xbot_id)
 
         # Lateral alignment: snap Y to target, keep current X absolute.
-        # We do NOT use _resolve here because the X coordinate is the
-        # mover's current position, not a target-relative offset.
         if not near(cur_y, target.y, HOLD_LATERAL_TOL / 2):
             ee = Pose2D(cur_x, target.y)
             if not fsm.check_guards(target, ee):
@@ -589,6 +601,52 @@ class LiftOffWithTiltRecovery:
         LiftOffWithTiltRecovery.move_to_xy(xbot_id, far_x, far_y, speed=XY_SPEED_FULL)
         time.sleep(DWELL_FAR)
         return far_x, far_y
+
+    # ─────────────────────────────────────────────────────
+    #  PHASE 2b: CORRIDOR ENTRY  (keep-out sphere boundary)
+    #
+    #  The mover advances to the exact point where the approach
+    #  axis pierces the keep-out sphere (–8 mm / –KEEPOUT_RADIUS).
+    #  This is the last waypoint *outside* the zone; the next
+    #  move (HOLD / CONTACT) crosses inside it intentionally.
+    #
+    #  Why a dedicated state here?
+    #    • It marks the precise "cleared to enter keep-out zone"
+    #      decision in the FSM and trajectory log.
+    #    • KeepOutChecker.violated() already permits penetration
+    #      when in_corridor=True, so no safety logic changes are
+    #      needed — the state just makes the gate explicit.
+    #    • The corridor has tightened to its near-field angle by
+    #      this distance; a lateral error that survived the wider
+    #      FAR cone is very likely caught here before contact.
+    # ─────────────────────────────────────────────────────
+    @staticmethod
+    def _phase_corridor_entry(xbot_id, fsm: DockingFSM, target: Pose2D):
+        print("\n=== PHASE 2b: CORRIDOR ENTRY  (keep-out sphere boundary @ "
+              f"{KEEPOUT_RADIUS*1e3:.0f} mm) ===")
+        resolve = LiftOffWithTiltRecovery._resolve
+
+        entry_x, entry_y = resolve(target, CORRIDOR_ENTRY_OFFSET_X, CORRIDOR_ENTRY_OFFSET_Y)
+        ee = Pose2D(entry_x, entry_y)
+
+        d, theta, theta_max, in_corridor = fsm.corridor.compute(target, ee)
+
+        print(f"  Position  : x={entry_x:.5f}  y={entry_y:.5f}")
+        print(f"  Distance  : {d*1e3:.2f} mm  (keep-out sphere surface)")
+        print(f"  Angle     : θ={math.degrees(theta):.2f}°  "
+              f"(corridor limit {math.degrees(theta_max):.1f}°)")
+        print(f"  Corridor  : {'✔ INSIDE — cleared to enter zone' if in_corridor else '✘ OUTSIDE — aborting'}")
+        print(f"  Note      : approach axis intersects keep-out zone — "
+              f"penetration is PERMITTED from this point (in_corridor=True).")
+
+        if not fsm.check_guards(target, ee):
+            return None, None
+
+        print(f"Advancing to corridor entry point ({entry_x:.4f}, {entry_y:.4f})  [quarter speed]")
+        LiftOffWithTiltRecovery.move_to_xy(xbot_id, entry_x, entry_y, speed=XY_SPEED_CORRIDOR)
+
+        print("✔ At keep-out sphere boundary.  Transitioning to MID_HOLD.")
+        return entry_x, entry_y
 
     # ─────────────────────────────────────────────────────
     #  PHASE 2: MID APPROACH  (half speed)
@@ -641,7 +699,7 @@ class LiftOffWithTiltRecovery:
     # ─────────────────────────────────────────────────────
     @staticmethod
     def run_liftoff_routine():
-        print("=== FSM DOCKING: FAR → MID → HOLD → CONTACT/CAPTURE ===\n")
+        print("=== FSM DOCKING: FAR → MID → CORRIDOR ENTRY → HOLD → CONTACT/CAPTURE ===\n")
 
         if not StartingUp.run_start_up_routine(1):
             return
@@ -650,10 +708,8 @@ class LiftOffWithTiltRecovery:
         fsm = DockingFSM()
 
         # Single source of truth for the dock position.
-        # Replace with a live sensor read here if tracking a moving target.
         target_pose = Pose2D(TARGET_X, TARGET_Y)
 
-        # Timer covers the full sequence from first move to capture
         docking_start = time.time()
         print("⏱ Docking timer started.")
 
@@ -675,6 +731,19 @@ class LiftOffWithTiltRecovery:
             print("❌ MID APPROACH aborted by guard.")
             return
 
+        # ── PHASE 2b: CORRIDOR ENTRY ──────────────────────
+        # Mover advances to the keep-out sphere surface (–8 mm).
+        # This is the explicit "cleared to enter keep-out zone" gate.
+        # The approach axis runs through the zone to the dock face;
+        # penetration from here is intentional (in_corridor=True).
+        fsm.advance(DockState.CORRIDOR_ENTRY)
+        entry_x, entry_y = LiftOffWithTiltRecovery._phase_corridor_entry(
+            xbot_id, fsm, target_pose
+        )
+        if entry_x is None:
+            print("❌ CORRIDOR ENTRY aborted by guard.")
+            return
+
         # ── PHASE 3: HOLD POINT (quarter speed) ──────────
         fsm.advance(DockState.MID_HOLD)
         base_x, base_y = LiftOffWithTiltRecovery._phase_hold(
@@ -685,11 +754,6 @@ class LiftOffWithTiltRecovery:
             return
 
         # ── PHASE 4: CONTACT & CAPTURE ───────────────────
-        # Contact point is dead center on the dock.
-        # No XY correction is applied after a failed attempt — any lateral
-        # nudge at sub-millimetre distances exceeds the tight corridor
-        # (±3°) and triggers a keep-out violation.
-        # The loop simply recovers Z and retries in place.
         fsm.advance(DockState.CONTACT)
         print("\n=== PHASE 4: CONTACT & CAPTURE ===")
         attempt = 1
@@ -724,7 +788,6 @@ class LiftOffWithTiltRecovery:
                     print("Please enter 'y' or 'n'.")
                 return
 
-            # Recover Z only – XY position stays fixed at dead center.
             print("❗ Collision or tilt → Recovering Z and retrying in place…")
             LiftOffWithTiltRecovery.recover(xbot_id)
             attempt += 1
@@ -743,19 +806,18 @@ def run_simulation_and_viz():
     keepout  = KeepOutChecker()
     fsm      = DockingFSM()
 
-    # Shorthand so waypoint tuples stay readable.
-    # Every position is expressed as (dx, dy) relative to target — the
-    # same mental model used by all the phase methods above.
     R = LiftOffWithTiltRecovery._resolve
 
-    # Waypoints no longer include the off-axis tilt correction step —
-    # the contact loop retries in place, so waypoint 5 goes straight to SUCCESS.
+    # Waypoints listed in sequence order.
+    # CORRIDOR_ENTRY sits at –KEEPOUT_RADIUS (–8 mm) on the approach axis —
+    # the exact point where the straight-in run pierces the keep-out sphere.
     waypoints = [
         (*R(target, -0.500,  0.010), DockState.FAR_APPROACH),   # slight lateral error
         (*R(target, -0.500,  0.000), DockState.FAR_APPROACH),   # lateral corrected
-        (*R(target, FAR_OFFSET_X,  FAR_OFFSET_Y),  DockState.FAR_APPROACH),
-        (*R(target, MID_OFFSET_X,  MID_OFFSET_Y),  DockState.MID_APPROACH),
-        (*R(target, HOLD_OFFSET_X, HOLD_OFFSET_Y), DockState.MID_HOLD),
+        (*R(target, FAR_OFFSET_X,       FAR_OFFSET_Y),       DockState.FAR_APPROACH),
+        (*R(target, MID_OFFSET_X,       MID_OFFSET_Y),       DockState.MID_APPROACH),
+        (*R(target, CORRIDOR_ENTRY_OFFSET_X, CORRIDOR_ENTRY_OFFSET_Y), DockState.CORRIDOR_ENTRY),
+        (*R(target, HOLD_OFFSET_X,      HOLD_OFFSET_Y),      DockState.MID_HOLD),
         (*R(target, -0.001,  0.000), DockState.CONTACT),
         (*R(target,  0.000,  0.000), DockState.SUCCESS),
     ]
@@ -776,6 +838,9 @@ def run_simulation_and_viz():
         print(f"  Angle     : θ={math.degrees(theta):.1f}°  (limit {math.degrees(theta_max):.1f}°)")
         print(f"  Corridor  : {'✔ INSIDE' if in_corr else '✘ OUTSIDE'}")
         print(f"  Keep-out  : {'🚨 VIOLATED' if ko else '✔ OK'}")
+        if ws == DockState.CORRIDOR_ENTRY:
+            print(f"  ► Approach axis intersects keep-out zone — "
+                  f"entry permitted from here (in_corridor=True).")
         print(f"  Guard     : {'✔ PASS' if ok else '✘ ABORT'}")
         print(f"{'─'*60}")
 
