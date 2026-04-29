@@ -2,7 +2,7 @@
   {
     "run_id": 1,
     "state_at_end": "ABORT",
-    "total_run_time_s": 4.249841213226318,
+    "total_run_time_s": 4.2487194538116455,
     "time_to_dock_s": NaN,
     "contact_attempts": 0,
     "final_lateral_err_m": NaN,
@@ -10,14 +10,14 @@
     "final_tilt_ry": NaN,
     "corridor_violations": 2,
     "keepout_violations": 0,
-    "final_pos_x_m": 0.6868673571944237,
-    "final_pos_y_m": 4.641363312900066,
-    "final_pos_error_m": 0.1482556812623613
+    "final_pos_x_m": 0.6865989550948143,
+    "final_pos_y_m": 4.7186049816012385,
+    "final_pos_error_m": 0.1485065799361465
   },
   {
     "run_id": 2,
     "state_at_end": "ABORT",
-    "total_run_time_s": 4.319313049316406,
+    "total_run_time_s": 4.263051748275757,
     "time_to_dock_s": NaN,
     "contact_attempts": 0,
     "final_lateral_err_m": NaN,
@@ -25,14 +25,14 @@
     "final_tilt_ry": NaN,
     "corridor_violations": 2,
     "keepout_violations": 0,
-    "final_pos_x_m": 0.7005607470870018,
-    "final_pos_y_m": 4.639744660556317,
-    "final_pos_error_m": 0.135554463402727
+    "final_pos_x_m": 0.6921403369307518,
+    "final_pos_y_m": 4.640739991366863,
+    "final_pos_error_m": 0.14334097453080388
   },
   {
     "run_id": 3,
     "state_at_end": "ABORT",
-    "total_run_time_s": 4.251827716827393,
+    "total_run_time_s": 4.275156497955322,
     "time_to_dock_s": NaN,
     "contact_attempts": 0,
     "final_lateral_err_m": NaN,
@@ -40,14 +40,14 @@
     "final_tilt_ry": NaN,
     "corridor_violations": 2,
     "keepout_violations": 0,
-    "final_pos_x_m": 0.6908299121260644,
-    "final_pos_y_m": 4.640894868075848,
-    "final_pos_error_m": 0.1445597616961382
+    "final_pos_x_m": 0.6904687365889549,
+    "final_pos_y_m": 4.640937592685223,
+    "final_pos_error_m": 0.14489598039389492
   },
   {
     "run_id": 4,
     "state_at_end": "ABORT",
-    "total_run_time_s": 4.288084983825684,
+    "total_run_time_s": 4.270979881286621,
     "time_to_dock_s": NaN,
     "contact_attempts": 0,
     "final_lateral_err_m": NaN,
@@ -55,14 +55,14 @@
     "final_tilt_ry": NaN,
     "corridor_violations": 2,
     "keepout_violations": 0,
-    "final_pos_x_m": 0.691789537370205,
-    "final_pos_y_m": 4.640781495273114,
-    "final_pos_error_m": 0.1436670563955242
+    "final_pos_x_m": 0.6859799060225487,
+    "final_pos_y_m": 4.641468140780926,
+    "final_pos_error_m": 0.14908551788873528
   },
   {
     "run_id": 5,
     "state_at_end": "ABORT",
-    "total_run_time_s": 4.29661750793457,
+    "total_run_time_s": 4.284503221511841,
     "time_to_dock_s": NaN,
     "contact_attempts": 0,
     "final_lateral_err_m": NaN,
@@ -70,8 +70,8 @@
     "final_tilt_ry": NaN,
     "corridor_violations": 2,
     "keepout_violations": 0,
-    "final_pos_x_m": 0.6992501696944237,
-    "final_pos_y_m": 4.6398995372653005,
-    "final_pos_error_m": 0.1367609784860945
+    "final_pos_x_m": 0.6916450366377831,
+    "final_pos_y_m": 4.640798585116864,
+    "final_pos_error_m": 0.1438014145125149
   }
 ]
